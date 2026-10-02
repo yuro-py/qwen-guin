@@ -1,268 +1,131 @@
-import math
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL = "Qwen/Qwen3-0.6B"
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-print("Loading tokenizer and reference model...")
-
-tok = AutoTokenizer.from_pretrained(MODEL)
-
-hf_model = AutoModelForCausalLM.from_pretrained(
-    MODEL,
-    dtype=torch.float32,
-).to(device)
-
-sd = hf_model.state_dict()
-config = hf_model.config
-
-# print(hf_model)
-# print("-----------------------------------------------------------------------------")
-# print(config)
-
-hidden = config.hidden_size
-layers = config.num_hidden_layers
-heads = config.num_attention_heads
-kv_heads = config.num_key_value_heads
-head_dim = config.head_dim
-
-repeat_factor = heads // kv_heads
-rope_theta = config.rope_parameters["rope_theta"]
-rms_norm_eps = config.rms_norm_eps
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def rope_with_offset(x, offset):
-    # x: [B, H, S, D]
-    d = x.shape[-1]
-    freqs = 1.0 / (
-        rope_theta
-        ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d)
-    )
-    pos = torch.arange(offset, offset + x.shape[-2], device=x.device, dtype=torch.float32)
-    angles = pos[:, None] * freqs[None, :]          # [S, D/2]
-    emb = torch.cat([angles, angles], dim=-1)       # [S, D]
-    cos = emb.cos()[None, None].to(x.dtype)
-    sin = emb.sin()[None, None].to(x.dtype)
+class Qwen3:
+    def __init__(self, state_dict, config):
+        self.w = state_dict
+        self.hidden = config.hidden_size
+        self.layers = config.num_hidden_layers
+        self.heads = config.num_attention_heads
+        self.kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.eps = config.rms_norm_eps
 
-    def rotate_half(t):
-        t1, t2 = t.chunk(2, dim=-1)
-        return torch.cat([-t2, t1], dim=-1)
-
-    return x * cos + rotate_half(x) * sin
-
-
-def forward(input_ids, past_key_values=None):
-    x = F.embedding(
-        input_ids,
-        sd["model.embed_tokens.weight"],
-    )
-
-    batch, seq_len, _ = x.shape
-
-    # Determine total context length for mask and RoPE
-    if past_key_values is not None:
-        past_len = past_key_values[0][0].shape[-2]
-    else:
-        past_len = 0
-
-    total_len = past_len + seq_len
-
-    # Mask shape: [1, 1, q_len, kv_len]
-    full_mask = torch.tril(
-        torch.ones(total_len, total_len, device=x.device, dtype=torch.bool)
-    )
-    mask = full_mask[past_len:, :][None, None, :, :]
-
-    new_past_key_values = []
-
-    for i in range(layers):
-        layer = f"model.layers.{i}"
-
-        # Attention input normalization
-        residual = x
-
-        x = F.rms_norm(
-            x,
-            (hidden,),
-            weight=sd[f"{layer}.input_layernorm.weight"],
-            eps=rms_norm_eps,
+        theta = config.rope_parameters["rope_theta"]
+        self.inv_freq = 1.0 / theta ** (
+            torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim
         )
 
-        # Query
-        q = F.linear(
-            x,
-            sd[f"{layer}.self_attn.q_proj.weight"],
+    def norm(self, x, weight):
+        return F.rms_norm(x, (x.shape[-1],), weight=weight, eps=self.eps)
+
+    def rope(self, x, offset):
+        pos = torch.arange(
+            offset, offset + x.shape[-2], device=x.device, dtype=torch.float32
         )
+        angles = pos[:, None] * self.inv_freq.to(x.device)[None, :]
+        emb = torch.cat([angles, angles], dim=-1)
+        cos, sin = emb.cos()[None, None], emb.sin()[None, None]
+        x1, x2 = x.chunk(2, dim=-1)
+        return x * cos.to(x.dtype) + torch.cat([-x2, x1], dim=-1) * sin.to(x.dtype)
 
-        q = q.view(
-            batch,
-            seq_len,
-            heads,
-            head_dim,
-        ).transpose(1, 2)
+    def forward(self, input_ids, past=None):
+        w = self.w
+        x = F.embedding(input_ids, w["model.embed_tokens.weight"])
+        batch, seq_len, _ = x.shape
 
-        # QK-Norm
-        q = F.rms_norm(
-            q,
-            (head_dim,),
-            weight=sd[f"{layer}.self_attn.q_norm.weight"],
-            eps=rms_norm_eps,
-        )
+        past_len = 0 if past is None else past[0][0].shape[-2]
+        total = past_len + seq_len
+        mask = torch.tril(
+            torch.ones(total, total, device=x.device, dtype=torch.bool)
+        )[past_len:][None, None]
 
-        q = rope_with_offset(q, past_len)
+        new_past = []
+        for i in range(self.layers):
+            layer = f"model.layers.{i}"
 
-        # Key
-        k = F.linear(
-            x,
-            sd[f"{layer}.self_attn.k_proj.weight"],
-        )
+            residual = x
+            x = self.norm(x, w[f"{layer}.input_layernorm.weight"])
 
-        k = k.view(
-            batch,
-            seq_len,
-            kv_heads,
-            head_dim,
-        ).transpose(1, 2)
+            q = self.rope(
+                self.norm(
+                    F.linear(x, w[f"{layer}.self_attn.q_proj.weight"])
+                    .view(batch, seq_len, self.heads, self.head_dim)
+                    .transpose(1, 2),
+                    w[f"{layer}.self_attn.q_norm.weight"],
+                ),
+                past_len,
+            )
+            k = self.rope(
+                self.norm(
+                    F.linear(x, w[f"{layer}.self_attn.k_proj.weight"])
+                    .view(batch, seq_len, self.kv_heads, self.head_dim)
+                    .transpose(1, 2),
+                    w[f"{layer}.self_attn.k_norm.weight"],
+                ),
+                past_len,
+            )
+            v = (
+                F.linear(x, w[f"{layer}.self_attn.v_proj.weight"])
+                .view(batch, seq_len, self.kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
 
-        # QK-Norm
-        k = F.rms_norm(
-            k,
-            (head_dim,),
-            weight=sd[f"{layer}.self_attn.k_norm.weight"],
-            eps=rms_norm_eps,
-        )
+            if past is not None:
+                k = torch.cat([past[i][0], k], dim=-2)
+                v = torch.cat([past[i][1], v], dim=-2)
+            new_past.append((k, v))
 
-        k = rope_with_offset(k, past_len)
+            attn = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, enable_gqa=True
+            )
+            attn = attn.transpose(1, 2).reshape(batch, seq_len, -1)
+            x = residual + F.linear(attn, w[f"{layer}.self_attn.o_proj.weight"])
 
-        # Value
-        v = F.linear(
-            x,
-            sd[f"{layer}.self_attn.v_proj.weight"],
-        )
+            residual = x
+            x = self.norm(x, w[f"{layer}.post_attention_layernorm.weight"])
+            gate = F.linear(x, w[f"{layer}.mlp.gate_proj.weight"])
+            up = F.linear(x, w[f"{layer}.mlp.up_proj.weight"])
+            x = residual + F.linear(
+                F.silu(gate) * up, w[f"{layer}.mlp.down_proj.weight"]
+            )
 
-        v = v.view(
-            batch,
-            seq_len,
-            kv_heads,
-            head_dim,
-        ).transpose(1, 2)
-
-        # Grouped-query attention
-        k = k.repeat_interleave(repeat_factor, dim=1)
-        v = v.repeat_interleave(repeat_factor, dim=1)
-
-        # KV Cache update (across time steps, not layers!)
-        if past_key_values is not None:
-            past_k, past_v = past_key_values[i]
-            k = torch.cat([past_k, k], dim=-2)
-            v = torch.cat([past_v, v], dim=-2)
-
-        new_past_key_values.append((k, v))
-
-        scores = q @ k.transpose(-2, -1)
-        scores = scores / math.sqrt(head_dim)
-        scores = scores.masked_fill(~mask, float("-inf"))
-
-        weights = F.softmax(scores, dim=-1)
-        attention = weights @ v
-
-        attention = attention.transpose(1, 2).contiguous()
-        attention = attention.view(batch, seq_len, heads * head_dim)
-
-        attention = F.linear(
-            attention,
-            sd[f"{layer}.self_attn.o_proj.weight"],
-        )
-
-        x = residual + attention
-
-        # MLP
-        residual = x
-
-        x = F.rms_norm(
-            x,
-            (hidden,),
-            weight=sd[f"{layer}.post_attention_layernorm.weight"],
-            eps=rms_norm_eps,
-        )
-
-        gate = F.linear(
-            x,
-            sd[f"{layer}.mlp.gate_proj.weight"],
-        )
-
-        up = F.linear(
-            x,
-            sd[f"{layer}.mlp.up_proj.weight"],
-        )
-
-        down = F.linear(
-            F.silu(gate) * up,
-            sd[f"{layer}.mlp.down_proj.weight"],
-        )
-
-        x = residual + down
-
-    # Final normalization
-    x = F.rms_norm(
-        x,
-        (hidden,),
-        weight=sd["model.norm.weight"],
-        eps=rms_norm_eps,
-    )
-
-    # Tied embedding/language-model head
-    logits = F.linear(
-        x,
-        sd["model.embed_tokens.weight"],
-    )
-
-    return logits, new_past_key_values
+        x = self.norm(x, w["model.norm.weight"])
+        return F.linear(x, w["model.embed_tokens.weight"]), new_past
 
 
-prompt = "explain transformer architecture"
-messages = [{"role": "user", "content": prompt}]
-input_ids = tok.apply_chat_template(
-    messages,
-    add_generation_prompt=True,
-    return_tensors="pt",
-    return_dict=False,
-    enable_thinking=False,   # Qwen3-specific: turn off thinking block
-).to(device)
+def main():
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    hf = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(DEVICE)
+    model = Qwen3(hf.state_dict(), hf.config)
 
-generated_ids = input_ids.clone()
-past_key_values = None
+    prompt = "create a super powerful interactive editable portfolio website in a single html file where I can add 'click/redirect' to any links I want"
+    input_ids = tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=False,
+        enable_thinking=False,
+    ).to(DEVICE)
 
-max_new_tokens = 100
+    generated = input_ids
+    past, next_token = None, None
+    with torch.no_grad():
+        for step in range(1500):
+            logits, past = model.forward(input_ids if step == 0 else next_token, past)
+            next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+            if next_token.item() == tok.eos_token_id:
+                break
+    print("\nPrompt :", prompt)
+    # print("\n")
+    print("Output :",tok.decode(generated[0, input_ids.shape[1]:], skip_special_tokens=True))
 
-with torch.no_grad():
-    for step in range(max_new_tokens):
-        # On the first step, process the full prompt.
-        # On subsequent steps, ONLY process the newly generated token.
-        if step == 0:
-            current_input = generated_ids
-        else:
-            current_input = next_token
 
-        logits, past_key_values = forward(current_input, past_key_values)
-
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-
-        generated_ids = torch.cat(
-            [generated_ids, next_token],
-            dim=1,
-        )
-
-        if next_token.item() == tok.eos_token_id:
-            break
-
-output = tok.decode(
-    generated_ids[0],
-    skip_special_tokens=True,
-)
-
-print()
-print("Prompt:", prompt)
-print("Output:", output)
+if __name__ == "__main__":
+    main()
