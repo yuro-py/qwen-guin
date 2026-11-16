@@ -104,7 +104,8 @@ def main():
     hf = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(DEVICE)
     model = Qwen3(hf.state_dict(), hf.config)
 
-    prompt = "create a super powerful interactive editable portfolio website in a single html file where I can add 'click/redirect' to any links I want"
+    # prompt = "create a super powerful interactive editable portfolio website in a single html file where I can add 'click/redirect' to any links I want"
+    prompt = "write a super funny dialogue exchange between a rebellious goon aand a narcissist leader"
     input_ids = tok.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
